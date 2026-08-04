@@ -1,0 +1,29 @@
+{
+  "name": "cloud-deploy-demo",
+  "version": "1.0.5",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "jest --ci --json --outputFile=test-results.json"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vvojtisek/cloud-deploy-demo.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/vvojtisek/cloud-deploy-demo/issues"
+  },
+  "homepage": "https://github.com/vvojtisek/cloud-deploy-demo#readme",
+  "dependencies": {
+    "express": "^5.2.1"
+  },
+  "devDependencies": {
+    "jest": "^30.4.2",
+    "supertest": "^7.2.2"
+  }
+}

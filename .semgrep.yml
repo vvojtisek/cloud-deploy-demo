@@ -1,0 +1,6 @@
+rules:
+  - id: no-hardcoded-passwords
+    pattern-regex: '(?i)(password|secret|key)\s*=\s*["''][^"'']{4,}["'']'
+    message: "Potential hardcoded credential found."
+    severity: ERROR
+    languages: [javascript]
