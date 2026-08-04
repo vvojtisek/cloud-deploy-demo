@@ -32,7 +32,7 @@ jobs:
           config: .semgrep.yml
 
       - name: Credential Scan (TruffleHog)
-        uses: trufflesecurity/trufflehog-for-github-actions@main
+        uses: trufflesecurity/trufflehog@main
         with:
           base: ""
           head: ${{ github.sha }}
