@@ -130,3 +130,15 @@ jobs:
               --task-definition $TASK_REV \
               --force-new-deployment
           fi
+
+      - name: Send Telegram Notification
+        if: always()
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_TO }}
+          token: ${{ secrets.TELEGRAM_TOKEN }}
+          message: |
+            🚀 Deployment Notification
+            Repository: ${{ github.repository }}
+            Commit: ${{ github.sha }}
+            Status: ${{ job.status }}   
