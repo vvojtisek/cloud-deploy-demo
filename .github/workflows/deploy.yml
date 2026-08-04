@@ -3,6 +3,8 @@ name: CI/CD Pipeline
 on:
   push:
     branches: [ main ]
+  pull_request:
+    branches: [ main ]
 
 permissions:
   id-token: write
@@ -58,6 +60,7 @@ jobs:
   build-and-deploy:
     name: Build, Push & Deploy to AWS
     needs: security-and-tests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     env:
       TELEGRAM_TO: ${{ secrets.TELEGRAM_TO }}
