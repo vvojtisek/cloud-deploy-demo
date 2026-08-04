@@ -1,0 +1,8 @@
+node_modules/
+*.swp
+test-results.json
+e2e-results.json
+sbom.spdx.json
+.terraform/
+*.tfstate
+*.tfstate.backup

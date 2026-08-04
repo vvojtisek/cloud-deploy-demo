@@ -21,7 +21,8 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
+          cache: npm
 
       - name: Install Dependencies
         run: npm ci
@@ -58,9 +59,23 @@ jobs:
     name: Build, Push & Deploy to AWS
     needs: security-and-tests
     runs-on: ubuntu-latest
+    env:
+      TELEGRAM_TO: ${{ secrets.TELEGRAM_TO }}
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Read application version
+        id: app-version
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Configure AWS Credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -77,16 +92,25 @@ jobs:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           ECR_REPOSITORY: cloud-deploy-demo
           IMAGE_TAG: ${{ github.sha }}
+          APP_VERSION: ${{ steps.app-version.outputs.version }}
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY:v1.0 .
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:v1.0
-          echo "IMAGE_URI=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_ENV
+          VERSION_TAG="v$APP_VERSION"
+          docker build \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:$VERSION_TAG" \
+            .
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$VERSION_TAG"
 
       - name: Deploy to ECS Service
+        env:
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+          APP_VERSION: ${{ steps.app-version.outputs.version }}
         run: |
+          set -euo pipefail
           echo "Updating ECS Task Definition..."
-          # Generujeme Task Definition pro ECS Fargate
           TASK_DEF=$(cat <<EOF
           {
             "family": "cloud-deploy-demo-task",
@@ -94,31 +118,39 @@ jobs:
             "requiresCompatibilities": ["FARGATE"],
             "cpu": "256",
             "memory": "512",
-            "executionRoleArn": "arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/cloud-deploy-demo-ecs-execution-role",
+            "executionRoleArn": "arn:aws:iam::$AWS_ACCOUNT_ID:role/cloud-deploy-demo-ecs-execution-role",
             "containerDefinitions": [
               {
                 "name": "app",
-                "image": "${{ steps.login-ecr.outputs.registry }}/cloud-deploy-demo:${{ github.sha }}",
+                "image": "$ECR_REGISTRY/cloud-deploy-demo:$IMAGE_TAG",
                 "portMappings": [{ "containerPort": 8080, "hostPort": 8080 }],
-                "environment": [{ "name": "APP_VERSION", "value": "1.0.0" }]
+                "environment": [{ "name": "APP_VERSION", "value": "$APP_VERSION" }]
               }
             ]
           }
           EOF
           )
-          
+
           TASK_REV=$(aws ecs register-task-definition --cli-input-json "$TASK_DEF" --query 'taskDefinition.taskDefinitionArn' --output text)
-          
+
           # Kontrola zda service existuje, pokud ne -> vytvořit
           if ! aws ecs describe-services --cluster cloud-deploy-demo-cluster --services cloud-deploy-demo-service --query 'services[0].status' --output text | grep -q "ACTIVE"; then
-            SUBNETS=$(cd terraform && terraform output -json subnet_ids | jq -r 'join(",")')
+            SUBNETS=$(aws ec2 describe-subnets \
+              --filters "Name=tag:Name,Values=cloud-deploy-demo-subnet-*" \
+              --query 'Subnets | sort_by(@, &AvailabilityZone)[:2].SubnetId' \
+              --output text | tr '\t' ',')
             SG=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=cloud-deploy-demo-ecs-sg" --query "SecurityGroups[0].GroupId" --output text)
             TG_ARN=$(aws elbv2 describe-target-groups --names cloud-deploy-demo-tg-blue --query "TargetGroups[0].TargetGroupArn" --output text)
-            
+
+            if [ -z "$SUBNETS" ] || [ "$SUBNETS" = "None" ] || [ "$SG" = "None" ] || [ "$TG_ARN" = "None" ]; then
+              echo "Required AWS networking resources were not found." >&2
+              exit 1
+            fi
+
             aws ecs create-service \
               --cluster cloud-deploy-demo-cluster \
               --service-name cloud-deploy-demo-service \
-              --task-definition $TASK_REV \
+              --task-definition "$TASK_REV" \
               --desired-count 1 \
               --launch-type FARGATE \
               --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SG],assignPublicIp=ENABLED}" \
@@ -127,18 +159,23 @@ jobs:
             aws ecs update-service \
               --cluster cloud-deploy-demo-cluster \
               --service cloud-deploy-demo-service \
-              --task-definition $TASK_REV \
+              --task-definition "$TASK_REV" \
               --force-new-deployment
           fi
 
+          aws ecs wait services-stable \
+            --cluster cloud-deploy-demo-cluster \
+            --services cloud-deploy-demo-service
+
       - name: Send Telegram Notification
-        if: always()
+        if: ${{ always() && env.TELEGRAM_TO != '' && env.TELEGRAM_TOKEN != '' }}
+        continue-on-error: true
         uses: appleboy/telegram-action@master
         with:
-          to: ${{ secrets.TELEGRAM_TO }}
-          token: ${{ secrets.TELEGRAM_TOKEN }}
+          to: ${{ env.TELEGRAM_TO }}
+          token: ${{ env.TELEGRAM_TOKEN }}
           message: |
             🚀 Deployment Notification
             Repository: ${{ github.repository }}
             Commit: ${{ github.sha }}
-            Status: ${{ job.status }}   
+            Status: ${{ job.status }}
