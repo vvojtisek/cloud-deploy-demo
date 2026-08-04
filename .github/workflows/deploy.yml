@@ -129,7 +129,18 @@ jobs:
           APP_VERSION: ${{ steps.app-version.outputs.version }}
         run: |
           set -euo pipefail
-          echo "Updating ECS Task Definition..."
+          CLUSTER="cloud-deploy-demo-cluster"
+          BLUE_SERVICE="cloud-deploy-demo-service"
+          GREEN_SERVICE="cloud-deploy-demo-green-service"
+          BLUE_TARGET_GROUP_NAME="cloud-deploy-demo-tg-blue"
+          GREEN_TARGET_GROUP_NAME="cloud-deploy-demo-tg-green"
+
+          if [[ ! "$APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "APP_VERSION must use MAJOR.MINOR.PATCH format; received '$APP_VERSION'." >&2
+            exit 1
+          fi
+
+          echo "Registering ECS task definition for version $APP_VERSION..."
           TASK_DEF=$(cat <<EOF
           {
             "family": "cloud-deploy-demo-task",
@@ -151,40 +162,196 @@ jobs:
           )
 
           TASK_REV=$(aws ecs register-task-definition --cli-input-json "$TASK_DEF" --query 'taskDefinition.taskDefinitionArn' --output text)
+          BLUE_TG_ARN=$(aws elbv2 describe-target-groups --names "$BLUE_TARGET_GROUP_NAME" --query 'TargetGroups[0].TargetGroupArn' --output text)
+          GREEN_TG_ARN=$(aws elbv2 describe-target-groups --names "$GREEN_TARGET_GROUP_NAME" --query 'TargetGroups[0].TargetGroupArn' --output text)
+          ALB_ARN=$(aws elbv2 describe-load-balancers --names cloud-deploy-demo-alb --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+          ALB_DNS=$(aws elbv2 describe-load-balancers --names cloud-deploy-demo-alb --query 'LoadBalancers[0].DNSName' --output text)
+          LISTENER_ARN=$(aws elbv2 describe-listeners --load-balancer-arn "$ALB_ARN" --query 'Listeners[?Port==`80`].ListenerArn | [0]' --output text)
 
-          # Kontrola zda service existuje, pokud ne -> vytvořit
-          if ! aws ecs describe-services --cluster cloud-deploy-demo-cluster --services cloud-deploy-demo-service --query 'services[0].status' --output text | grep -q "ACTIVE"; then
-            SUBNETS=$(aws ec2 describe-subnets \
+          if [[ "$BLUE_TG_ARN" == "None" || "$GREEN_TG_ARN" == "None" || "$ALB_ARN" == "None" || "$LISTENER_ARN" == "None" ]]; then
+            echo "Required ECS or ALB resources were not found." >&2
+            exit 1
+          fi
+
+          service_is_active() {
+            local service_name="$1"
+            [[ "$(aws ecs describe-services --cluster "$CLUSTER" --services "$service_name" --query 'services[0].status' --output text)" == "ACTIVE" ]]
+          }
+
+          wait_for_healthy_target() {
+            local target_group_arn="$1"
+            local attempt healthy_targets
+
+            for attempt in {1..18}; do
+              healthy_targets=$(aws elbv2 describe-target-health \
+                --target-group-arn "$target_group_arn" \
+                --query "length(TargetHealthDescriptions[?TargetHealth.State=='healthy'])" \
+                --output text)
+              if [[ "$healthy_targets" =~ ^[1-9][0-9]*$ ]]; then
+                return 0
+              fi
+              echo "Waiting for a healthy target in $target_group_arn (attempt $attempt/18)..."
+              sleep 10
+            done
+
+            return 1
+          }
+
+          wait_for_live_version() {
+            local attempt health_response
+
+            for attempt in {1..12}; do
+              if health_response=$(curl --fail --silent --show-error --connect-timeout 5 --max-time 10 "http://$ALB_DNS/health"); then
+                if grep -Fq "\"version\":\"$APP_VERSION\"" <<< "$health_response"; then
+                  return 0
+                fi
+              fi
+              echo "Waiting for the load balancer to serve version $APP_VERSION (attempt $attempt/12)..."
+              sleep 5
+            done
+
+            return 1
+          }
+
+          create_blue_service() {
+            local subnets security_group
+            subnets=$(aws ec2 describe-subnets \
               --filters "Name=tag:Name,Values=cloud-deploy-demo-subnet-*" \
               --query 'Subnets | sort_by(@, &AvailabilityZone)[:2].SubnetId' \
               --output text | tr '\t' ',')
-            SG=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=cloud-deploy-demo-ecs-sg" --query "SecurityGroups[0].GroupId" --output text)
-            TG_ARN=$(aws elbv2 describe-target-groups --names cloud-deploy-demo-tg-blue --query "TargetGroups[0].TargetGroupArn" --output text)
+            security_group=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=cloud-deploy-demo-ecs-sg" --query 'SecurityGroups[0].GroupId' --output text)
 
-            if [ -z "$SUBNETS" ] || [ "$SUBNETS" = "None" ] || [ "$SG" = "None" ] || [ "$TG_ARN" = "None" ]; then
+            if [[ -z "$subnets" || "$subnets" == "None" || "$security_group" == "None" ]]; then
               echo "Required AWS networking resources were not found." >&2
-              exit 1
+              return 1
             fi
 
             aws ecs create-service \
-              --cluster cloud-deploy-demo-cluster \
-              --service-name cloud-deploy-demo-service \
+              --cluster "$CLUSTER" \
+              --service-name "$BLUE_SERVICE" \
               --task-definition "$TASK_REV" \
               --desired-count 1 \
               --launch-type FARGATE \
-              --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SG],assignPublicIp=ENABLED}" \
-              --load-balancers "targetGroupArn=$TG_ARN,containerName=app,containerPort=8080"
-          else
-            aws ecs update-service \
-              --cluster cloud-deploy-demo-cluster \
-              --service cloud-deploy-demo-service \
-              --task-definition "$TASK_REV" \
-              --force-new-deployment
+              --network-configuration "awsvpcConfiguration={subnets=[$subnets],securityGroups=[$security_group],assignPublicIp=ENABLED}" \
+              --load-balancers "targetGroupArn=$BLUE_TG_ARN,containerName=app,containerPort=8080"
+          }
+
+          # A fresh environment starts on blue. Later deployments discover the live colour from the ALB listener.
+          if ! service_is_active "$BLUE_SERVICE" && ! service_is_active "$GREEN_SERVICE"; then
+            echo "Creating the initial blue ECS service..."
+            create_blue_service
+            aws ecs wait services-stable --cluster "$CLUSTER" --services "$BLUE_SERVICE"
+            wait_for_healthy_target "$BLUE_TG_ARN"
+            echo "Deployment mode: initial blue service" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
 
-          aws ecs wait services-stable \
-            --cluster cloud-deploy-demo-cluster \
-            --services cloud-deploy-demo-service
+          ACTIVE_TG_ARN=$(aws elbv2 describe-listeners --listener-arns "$LISTENER_ARN" --query 'Listeners[0].DefaultActions[0].TargetGroupArn' --output text)
+          if [[ "$ACTIVE_TG_ARN" == "$BLUE_TG_ARN" ]]; then
+            ACTIVE_SERVICE="$BLUE_SERVICE"
+            INACTIVE_SERVICE="$GREEN_SERVICE"
+            INACTIVE_TG_ARN="$GREEN_TG_ARN"
+          elif [[ "$ACTIVE_TG_ARN" == "$GREEN_TG_ARN" ]]; then
+            ACTIVE_SERVICE="$GREEN_SERVICE"
+            INACTIVE_SERVICE="$BLUE_SERVICE"
+            INACTIVE_TG_ARN="$BLUE_TG_ARN"
+          else
+            echo "The ALB listener does not point to a known blue or green target group." >&2
+            exit 1
+          fi
+
+          if ! service_is_active "$ACTIVE_SERVICE"; then
+            echo "The active listener colour has no active ECS service." >&2
+            exit 1
+          fi
+
+          ACTIVE_TASK_DEF=$(aws ecs describe-services --cluster "$CLUSTER" --services "$ACTIVE_SERVICE" --query 'services[0].taskDefinition' --output text)
+          CURRENT_VERSION=$(aws ecs describe-task-definition --task-definition "$ACTIVE_TASK_DEF" --query "taskDefinition.containerDefinitions[?name=='app'].environment[?name=='APP_VERSION'].value | [0]" --output text)
+          if [[ ! "$CURRENT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "The active service has no valid APP_VERSION; refusing an unsafe deployment." >&2
+            exit 1
+          fi
+
+          CURRENT_MAJOR="${CURRENT_VERSION%%.*}"
+          TARGET_MAJOR="${APP_VERSION%%.*}"
+          if [[ "$CURRENT_MAJOR" == "$TARGET_MAJOR" ]]; then
+            echo "Rolling out $APP_VERSION on the active colour because the major version is unchanged."
+            aws ecs update-service \
+              --cluster "$CLUSTER" \
+              --service "$ACTIVE_SERVICE" \
+              --task-definition "$TASK_REV" \
+              --force-new-deployment
+            aws ecs wait services-stable --cluster "$CLUSTER" --services "$ACTIVE_SERVICE"
+            wait_for_healthy_target "$ACTIVE_TG_ARN"
+            echo "Deployment mode: rolling update ($CURRENT_VERSION -> $APP_VERSION)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "Major version change detected ($CURRENT_VERSION -> $APP_VERSION); preparing the inactive colour."
+          ACTIVE_SUBNETS=$(aws ecs describe-services --cluster "$CLUSTER" --services "$ACTIVE_SERVICE" --query 'services[0].networkConfiguration.awsvpcConfiguration.subnets' --output text | tr '\t' ',')
+          ACTIVE_SECURITY_GROUPS=$(aws ecs describe-services --cluster "$CLUSTER" --services "$ACTIVE_SERVICE" --query 'services[0].networkConfiguration.awsvpcConfiguration.securityGroups' --output text | tr '\t' ',')
+          ASSIGN_PUBLIC_IP=$(aws ecs describe-services --cluster "$CLUSTER" --services "$ACTIVE_SERVICE" --query 'services[0].networkConfiguration.awsvpcConfiguration.assignPublicIp' --output text)
+          if [[ -z "$ACTIVE_SUBNETS" || "$ACTIVE_SUBNETS" == "None" || -z "$ACTIVE_SECURITY_GROUPS" || "$ACTIVE_SECURITY_GROUPS" == "None" || "$ASSIGN_PUBLIC_IP" == "None" ]]; then
+            echo "Could not read the active service network configuration." >&2
+            exit 1
+          fi
+
+          TRAFFIC_SWITCHED=false
+          CANDIDATE_STARTED=false
+          rollback() {
+            local exit_code=$?
+            trap - ERR
+            echo "Major-version deployment failed; restoring the original live version $CURRENT_VERSION." >&2
+            if [[ "$TRAFFIC_SWITCHED" == "true" ]]; then
+              aws elbv2 modify-listener \
+                --listener-arn "$LISTENER_ARN" \
+                --default-actions "Type=forward,TargetGroupArn=$ACTIVE_TG_ARN" || true
+            fi
+            if [[ "$CANDIDATE_STARTED" == "true" ]]; then
+              aws ecs update-service --cluster "$CLUSTER" --service "$INACTIVE_SERVICE" --desired-count 0 >/dev/null || true
+            fi
+            exit "$exit_code"
+          }
+          trap rollback ERR
+
+          if service_is_active "$INACTIVE_SERVICE"; then
+            aws ecs update-service \
+              --cluster "$CLUSTER" \
+              --service "$INACTIVE_SERVICE" \
+              --task-definition "$TASK_REV" \
+              --desired-count 1 \
+              --force-new-deployment
+          else
+            aws ecs create-service \
+              --cluster "$CLUSTER" \
+              --service-name "$INACTIVE_SERVICE" \
+              --task-definition "$TASK_REV" \
+              --desired-count 1 \
+              --launch-type FARGATE \
+              --network-configuration "awsvpcConfiguration={subnets=[$ACTIVE_SUBNETS],securityGroups=[$ACTIVE_SECURITY_GROUPS],assignPublicIp=$ASSIGN_PUBLIC_IP}" \
+              --load-balancers "targetGroupArn=$INACTIVE_TG_ARN,containerName=app,containerPort=8080"
+          fi
+          CANDIDATE_STARTED=true
+
+          aws ecs wait services-stable --cluster "$CLUSTER" --services "$INACTIVE_SERVICE"
+          if ! wait_for_healthy_target "$INACTIVE_TG_ARN"; then
+            echo "The candidate colour did not become healthy." >&2
+            false
+          fi
+
+          aws elbv2 modify-listener \
+            --listener-arn "$LISTENER_ARN" \
+            --default-actions "Type=forward,TargetGroupArn=$INACTIVE_TG_ARN"
+          TRAFFIC_SWITCHED=true
+
+          if ! wait_for_live_version; then
+            echo "The load balancer did not serve the target version after the traffic switch." >&2
+            false
+          fi
+
+          trap - ERR
+          echo "Blue/green promotion completed: $CURRENT_VERSION -> $APP_VERSION. The previous colour remains running for the next major-version rollback path."
+          echo "Deployment mode: blue/green ($CURRENT_VERSION -> $APP_VERSION)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Send Telegram Notification
         if: ${{ always() && env.TELEGRAM_TO != '' && env.TELEGRAM_TOKEN != '' }}
