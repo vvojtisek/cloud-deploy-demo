@@ -46,11 +46,18 @@ jobs:
           format: spdx-json
           output-file: sbom.spdx.json
 
+      - name: Scan SBOM for Vulnerabilities (Grype)
+        uses: anchore/scan-action@v7
+        with:
+          sbom: sbom.spdx.json
+          fail-build: false
+
       - name: Run Unit Tests
         run: npm test
 
       - name: Upload Audit Artifacts
         uses: actions/upload-artifact@v6
+        if: always()
         with:
           name: audit-records-${{ github.sha }}
           path: |
