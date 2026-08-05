@@ -353,6 +353,64 @@ jobs:
           echo "Blue/green promotion completed: $CURRENT_VERSION -> $APP_VERSION. The previous colour remains running for the next major-version rollback path."
           echo "Deployment mode: blue/green ($CURRENT_VERSION -> $APP_VERSION)" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Run E2E HTTP test against live ALB
+        id: e2e-http-test
+        env:
+          APP_VERSION: ${{ steps.app-version.outputs.version }}
+        run: |
+          set -uo pipefail
+          RESULT_FILE="e2e-results.json"
+          RESPONSE_FILE="e2e-response.json"
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --names cloud-deploy-demo-alb \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text 2>&1)
+          ALB_LOOKUP_EXIT=$?
+          TARGET_URL="http://${ALB_DNS}/health"
+          HTTP_STATUS="000"
+          CURL_EXIT=1
+
+          if [[ $ALB_LOOKUP_EXIT -eq 0 && -n "$ALB_DNS" && "$ALB_DNS" != "None" ]]; then
+            HTTP_STATUS=$(curl --silent --show-error --output "$RESPONSE_FILE" \
+              --write-out '%{http_code}' --connect-timeout 5 --max-time 20 "$TARGET_URL")
+            CURL_EXIT=$?
+          else
+            printf '%s\n' "$ALB_DNS" > "$RESPONSE_FILE"
+          fi
+
+          STATUS="failed"
+          if [[ $ALB_LOOKUP_EXIT -eq 0 && $CURL_EXIT -eq 0 && "$HTTP_STATUS" == "200" ]] \
+            && jq -e --arg version "$APP_VERSION" \
+              '.status == "healthy" and .version == $version' "$RESPONSE_FILE" >/dev/null; then
+            STATUS="passed"
+          fi
+
+          jq -n \
+            --arg timestamp "$(date --utc +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg url "$TARGET_URL" \
+            --arg expected_version "$APP_VERSION" \
+            --arg http_status "$HTTP_STATUS" \
+            --argjson alb_lookup_exit "$ALB_LOOKUP_EXIT" \
+            --argjson curl_exit "$CURL_EXIT" \
+            --arg status "$STATUS" \
+            --rawfile response "$RESPONSE_FILE" \
+            '{timestamp: $timestamp, target_url: $url, expected_version: $expected_version, http_status: $http_status, alb_lookup_exit: $alb_lookup_exit, curl_exit: $curl_exit, status: $status, response: $response}' \
+            > "$RESULT_FILE"
+
+          rm -f "$RESPONSE_FILE"
+          if [[ "$STATUS" != "passed" ]]; then
+            echo "E2E HTTP test failed; see $RESULT_FILE for audit details." >&2
+            exit 1
+          fi
+
+      - name: Upload E2E audit result
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: e2e-results-${{ github.sha }}
+          path: e2e-results.json
+          if-no-files-found: error
+
       - name: Send Telegram Notification
         if: ${{ always() && env.TELEGRAM_TO != '' && env.TELEGRAM_TOKEN != '' }}
         continue-on-error: true

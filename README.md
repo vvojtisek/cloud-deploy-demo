@@ -13,7 +13,7 @@ Run the service locally with `npm start`. It listens on port 8080 by default.
 
 ## Automated deployment
 
-Pushing to `main` starts [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml). The workflow runs dependency installation, security scans, tests, builds the Node 24 container, pushes both the commit-SHA and semantic-version image tags to ECR, and waits for ECS to reach a stable deployment.
+Pushing to `main` starts [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml). The workflow runs dependency installation, security scans, tests, builds the Node 24 container, pushes both the commit-SHA and semantic-version image tags to ECR, and waits for ECS to reach a stable deployment. After deployment, it performs an E2E HTTP test against the live Application Load Balancer and uploads `e2e-results.json` as an audit artifact.
 
 Patch and minor releases use a rolling update on the colour currently serving traffic. A major-version change stages the new image on the inactive blue/green target group, waits for ECS and ALB health checks, then switches the listener. If staging or post-switch health verification fails, the workflow restores the listener to the original colour and scales down the failed candidate.
 
